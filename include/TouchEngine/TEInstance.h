@@ -19,8 +19,10 @@
 #include <TouchEngine/TEObject.h>
 #include <TouchEngine/TEResult.h>
 #include <TouchEngine/TETexture.h>
+#include <TouchEngine/TESemaphore.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include <assert.h>
 
 #ifdef __cplusplus
@@ -37,11 +39,21 @@ typedef TE_ENUM(TEEvent, int32_t)
 	TEEventGeneral,
 
 	/*
+	An instance is ready and waiting to be loaded.
+	*/
+	TEEventInstanceReady,
+
+	/*
 	Loading an instance has completed. When this is received, all links
 	will have been added to the instance. You can begin requesting frames from the
 	instance.
 	*/
 	TEEventInstanceDidLoad,
+
+	/*
+	Unloading an instance has completed.
+	*/
+	TEEventInstanceDidUnload,
 
 	/*
 	A frequested frame has finished or been cancelled.
@@ -232,11 +244,46 @@ typedef TE_ENUM(TELinkDomain, int32_t)
 	TELinkDomainOperator,
 };
 
+typedef TE_ENUM(TELinkInterest, int32_t)
+{
+	/*
+	 No TELinkEvents will be received
+	 You must not get the value of the link
+	 */
+	TELinkInterestNone,
+
+	/*
+	 TELinkEventValueChange will not be received
+	 You must not get the value of the link
+	 */
+	TELinkInterestNoValues,
+
+	/*
+	 You must not get the value of the link until after TELinkEventValueChange has next been received
+	 After TELinkEventValueChange is received, the interest will change to TELinkInterestAll
+	 */
+	TELinkInterestSubsequentValues,
+
+	/*
+	 All TELinksEvents will be received
+	 The caller may get the value of the link
+	 */
+	TELinkInterestAll,
+};
+
 typedef struct TEInstance_ TEInstance;
 typedef struct TEAdapter_ TEAdapter;
 typedef TEObject TEGraphicsContext;
 typedef struct TETable_ TETable;
 typedef struct TEFloatBuffer_ TEFloatBuffer;
+
+struct TEColor
+{
+	double red;
+	double green;
+	double blue;
+	double alpha;
+};
 
 struct TELinkInfo
 {
@@ -317,6 +364,86 @@ struct TEStringArray
 	const char * TE_NONNULL const * TE_NULLABLE	strings;
 };
 
+
+struct TEInstanceStatistics
+{
+	/*
+	 In bytes
+	 */
+	int64_t	memUsedGPU;
+	
+	/*
+	 In bytes
+	 */
+	int64_t	memUsedCPU;
+
+	/*
+	 The CPU time for the frames, in nanoseconds
+	 */
+	int64_t	frameTimeCPU;
+	
+	/*
+	 The GPU time for the frames, in nanoseconds
+	 This value is delayed by one frame
+	 A value of -1 indicates this value is not available due to the version
+	 	of TouchDesigner being used
+	 */
+	int64_t	frameTimeGPU;
+	
+	/*
+	 The number of frames processed since statistics were last delivered
+	 */
+	int64_t	frames;
+
+	/*
+	 The number of frames dropped since statistics were last delivered
+	 A value of -1 indicates this value is not available due to the version
+	 	of TouchDesigner being used
+	 */
+	int64_t	framesDropped;
+};
+
+struct TEError
+{
+	/*
+	 The domain for the error
+	 */
+	const char *		domain;
+
+	/*
+	 A code for the error, which is meaningful for the domain
+	 */
+	int32_t				code;
+
+	/*
+	 The severity of the error
+	 */
+	TESeverity			severity;
+
+	/*
+	 The human readable description for the error as a null-terminated UTF-8 encoded string
+	 */
+	const char *		description;
+
+	/*
+	 The location for the error, meaningful for the domain, as a null-terminated UTF-8 encoded string
+	 */
+	const char *		location;
+};
+
+struct TEErrorArray
+{
+	/*
+	 The number of errors in the array
+	 */
+	int32_t						count;
+
+	/*
+	 The array of errors
+	 */
+	const struct TEError *		errors;
+};
+
 /*
  This callback is used to signal events related to an instance.
  Note callbacks may be invoked from any thread.
@@ -337,6 +464,13 @@ typedef void (*TEInstanceEventCallback)(TEInstance *instance,
 typedef void (*TEInstanceLinkCallback)(TEInstance *instance, TELinkEvent event, const char *identifier, void *info);
 
 /*
+ This callback is used to deliver statistics about the instance.
+ Note callbacks may be invoked from any thread.
+ */
+typedef void (*TEInstanceStatisticsCallback)(TEInstance *instance,
+											const struct TEInstanceStatistics *statistics,
+											void * TE_NULLABLE info);
+/*
  On return, extensions is a list of file extensions supported by TEInstanceCreate
  The caller is responsible for releasing the returned TEStringArray using TERelease()
  */
@@ -346,6 +480,7 @@ TE_EXPORT TEResult TEInstanceGetSupportedFileExtensions(struct TEStringArray * T
  Creates an instance.
  
  'event_callback' will be called to deliver TEEvents related to loading and rendering the instance.
+ 'link_callback' will be called to deliver TELinkEvents related to the instance's links.
  'callback_info' will be passed into the callbacks as the 'info' argument.
  'instance' will be set to a TEInstance on return, or NULL if an instance could not be created.
 	The caller is responsible for releasing the returned TEInstance using TERelease()
@@ -357,25 +492,39 @@ TE_EXPORT TEResult TEInstanceCreate(TEInstanceEventCallback event_callback,
 									TEInstance * TE_NULLABLE * TE_NONNULL instance);
 
 /*
- Loads a .tox file.
+ Configures an instance for a .tox file which you subsequently intend to load.
+ Any in-progress configuration is cancelled.
  Any currently loaded instance will be unloaded.
+ The instance is readied but the .tox file is not loaded. Once the instance is ready, your
+ TEInstanceEventCallback will receive TEEventInstanceReady and a TEResult indicating success or failure.
+ If you wish, you may immediately call TEInstanceLoad() after calling this function, without waiting
+ for the TEEventInstanceReady event.
+ You may pass a NULL argument for 'path' in which case the instance is readied but cannot be loaded.
+
+ 'path' is a UTF-8 encoded string, or NULL.
+ 'mode' see TETimeMode above - ignored if 'path' is NULL.
+ */
+TE_EXPORT TEResult TEInstanceConfigure(TEInstance *instance, const char * TE_NULLABLE path, TETimeMode mode);
+
+/*
+ Loads a .tox file which you have previously set using TEInstanceConfigure().
+ Any currently loaded instance will be unloaded.
+ The file is loaded asynchronously after this function returns.
  The instance is loaded and put into a suspended state. During loading, your TEInstanceLinkCallback
  may receive events as links are added to the instance. Once loading is complete, your
  TEInstanceEventCallback will receive TEEventInstanceDidLoad and a TEResult indicating success or
  failure.
  Once loading is complete, call TEInstanceResume() when you are ready to allow rendering.
 
- 'path' is a UTF-8 encoded string. The file is loaded asynchronously after this function returns.
- 'mode' see TETimeMode above.
  */
-TE_EXPORT TEResult TEInstanceLoad(TEInstance *instance, const char *path, TETimeMode mode);
+TE_EXPORT TEResult TEInstanceLoad(TEInstance *instance);
 
 /*
  Any in-progress frame is cancelled.
  Any currently loaded instance is unloaded.
  During unload your TEInstanceLinkCallback will receive events for any links as they are
- removed from the instance.
- Once this function returns you will receive no further callbacks until another file is loaded.
+ removed from the instance. Once the instance has unloaded your TEInstanceEventCallback will
+ receive TEEventInstanceReady.
  */
 TE_EXPORT TEResult TEInstanceUnload(TEInstance *instance);
 
@@ -384,17 +533,24 @@ TE_EXPORT TEResult TEInstanceUnload(TEInstance *instance);
  */
 TE_EXPORT bool TEInstanceHasFile(TEInstance *instance);
 
-TE_EXPORT const char *TEInstanceGetPath(TEInstance *instance);
+/*
+ On return 'string' is the .tox file path set on the instance, or an empty string if no .tox
+ 	file has been set.
+ The caller is responsible for releasing the returned TEString using TERelease(). 
+ */
+TE_EXPORT void TEInstanceGetPath(TEInstance *instance, struct TEString * TE_NULLABLE * TE_NONNULL string);
 
 TE_EXPORT TETimeMode TEInstanceGetTimeMode(TEInstance *instance);
 
 /*
  Associates an instance with a graphics context. This optional association permits optimizations when
- working with texture inputs and outputs.
+ working with texture inputs and outputs and, for some instances, enables additional texture types.
  To most clearly communicate your intentions to the instance, call this prior to the initial call to
 	TEInstanceResume(), and subsequently if you require support for a different context.
  One context may be shared between several instances.
- This function will call TEInstanceAssociateAdapter on your behalf.
+ This function will call TEInstanceAssociateAdapter() on your behalf.
+ This function will call TEInstanceSetOutputTextureOrigin() on your behalf to match the native origin
+ for the context. If native orientation is not desired, call TEInstanceSetOutputTextureOrigin() afterwards.
  */
 TE_EXPORT TEResult TEInstanceAssociateGraphicsContext(TEInstance *instance, TEGraphicsContext *context);
 
@@ -405,6 +561,16 @@ TE_EXPORT TEResult TEInstanceAssociateGraphicsContext(TEInstance *instance, TEGr
 	TEInstanceResume(), and subsequently if you require support for a different adapter.
  */
 TE_EXPORT TEResult TEInstanceAssociateAdapter(TEInstance *instance, TEAdapter * TE_NULLABLE adapter);
+
+/*
+ Configures the origin for texture outputs.
+ */
+TE_EXPORT TEResult TEInstanceSetOutputTextureOrigin(TEInstance *instance, TETextureOrigin origin);
+
+/*
+ Returns the configured orientation for texture outputs.
+ */
+TE_EXPORT TETextureOrigin TEInstanceGetOutputTextureOrigin(TEInstance *instance);
 
 /*
  Resumes an instance
@@ -446,9 +612,96 @@ TE_EXPORT TEResult TEInstanceGetFrameRate(TEInstance *instance, int64_t *numerat
  'rate' is filled out when the function completes.
  */
 TE_EXPORT TEResult TEInstanceGetFloatFrameRate(TEInstance* instance, float* rate);
+
+/*
+'stats_callback' will be called to deliver statistics related to the instance.
+	This argument may be NULL, in which case no statistics will be delivered.
+ */
+TE_EXPORT TEResult TEInstanceSetStatisticsCallback(TEInstance *instance, TEInstanceStatisticsCallback TE_NULLABLE callback);
+
 /*
  Rendering
  */
+
+/*
+ Returns via 'types' the TETextureTypes supported by the instance.
+ This may change during configuration of an instance, and must be queried after receiving TEEventInstanceReady
+ 'types' is an array of TETextureType, or NULL, in which case the value at counts is set to the number of available types
+ 'count' is a pointer to an int32_t which should be set to the number of available elements in 'types'.
+ If this function returns TEResultSuccess, 'count' is set to the number of TETextureType filled in 'types'
+ If this function returns TEResultInsufficientMemory, the value at 'count' was too small to return all the types, and
+ 	'count' has been set to the number of available types. Resize 'types' appropriately and call the function again to
+ 	retrieve the full array of types. 
+ Where multiple types are returned, they may be selected for output by association of a suitable TEGraphicsContext
+ */
+TE_EXPORT TEResult TEInstanceGetSupportedTextureTypes(TEInstance *instance, TETextureType types[TE_NULLABLE], int32_t *count);
+
+/*
+ Returns via 'formats' the TETextureFormats supported by the instance.
+ This may change during configuration of an instance, and must be queried after receiving TEEventInstanceReady
+ Versions of this function exist for each graphics API and those versions should be preferred over this one, as they
+ can express types supported by future versions of TouchDesigner
+ 'formats' is an array of TETextureFormat, or NULL, in which case the value at counts is set to the number of available formats
+ 'count' is a pointer to an int32_t which should be set to the number of available elements in 'formats'.
+ If this function returns TEResultSuccess, 'count' is set to the number of TETextureFormat filled in 'formats'
+ If this function returns TEResultInsufficientMemory, the value at 'count' was too small to return all the formats, and
+ 	'count' has been set to the number of available formats. Resize 'formats' appropriately and call the function again to
+ 	retrieve the full array of formats. 
+ */
+TE_EXPORT TEResult TEInstanceGetSupportedTextureFormats(TEInstance *instance, TETextureFormat formats[TE_NULLABLE], int32_t *count);
+
+/*
+ Returns via 'types' the TESemaphoreTypes supported by the instance.
+ This may change during configuration of an instance, and must be queried after receiving TEEventInstanceReady
+ 'types' is an array of TESemaphoreType, or NULL, in which case the value at counts is set to the number of available types
+ 'count' is a pointer to an int32_t which should be set to the number of available elements in 'types'.
+ If this function returns TEResultSuccess, 'count' is set to the number of TESemaphoreType filled in 'types'
+ If this function returns TEResultInsufficientMemory, the value at 'count' was too small to return all the types, and
+ 	'count' has been set to the number of available types. Resize 'types' appropriately and call the function again to
+ 	retrieve the full array of types. 
+ */
+TE_EXPORT TEResult TEInstanceGetSupportedSemaphoreTypes(TEInstance *instance, TESemaphoreType types[TE_NULLABLE], int32_t *count);
+
+/*
+ Returns true if the instance requires ownership transfer via TEInstanceAddTextureTransfer() (or equivalent)
+ This may change during configuration of an instance, and must be queried after receiving TEEventInstanceReady
+ 'instance' is an instance which has previously been configured.
+ */
+TE_EXPORT bool TEInstanceDoesTextureOwnershipTransfer(TEInstance *instance);
+
+/*
+ Provide the instance with a semaphore to synchronize texture usage by the instance. Note that the texture may not be
+ 	used, in which case the seamphore will not be used.
+ 'texture' is the texture to synchronize usage of
+ 'semaphore' is a TESemaphore to synchronize usage
+ 	The instance will wait for this semaphore prior to using the texture
+ 	If this semaphore is a Vulkan binary semaphore, the instance will also signal this semaphore after waiting
+ 	To synchronize a D3D11 texture with a DXGI Keyed Mutex, pass NULL for this value
+ 'waitValue' is, if appropriate for the semaphore type, a value for the semaphore wait operation
+ */
+TE_EXPORT TEResult TEInstanceAddTextureTransfer(TEInstance *instance, TETexture *texture, TESemaphore * TE_NULLABLE semaphore, uint64_t value);
+
+/*
+ Returns true if 'instance' has a pending texture transfer for 'texture'
+ */
+TE_EXPORT bool TEInstanceHasTextureTransfer(TEInstance *instance, const TETexture *texture);
+
+/*
+ Get the semaphore needed to transfer ownership from the instance prior to using a texture, if
+ such an operation is pending.
+ 'texture' is a texture associated with one of the instance's links
+ 'semaphore' is, on successful return, a TESemaphore to synchronize the transfer on the GPU
+ 	The caller must wait for this semaphore prior to using the texture
+ 	If this semaphore is a Vulkan binary semaphore, the caller must also signal this semaphore after waiting
+ 	If the TETexture is a D3D11 texture and this value is NULL, use a DXGI Keyed Mutex acquire operation on the
+ 	instantiated texture
+	The caller is responsible for releasing the returned TESemaphore using TERelease()
+ 'waitValue' is, on successful return and if appropriate for the semaphore type, a value for the semaphore wait operation
+ */
+TE_EXPORT TEResult TEInstanceGetTextureTransfer(TEInstance *instance,
+												const TETexture *texture,
+												TESemaphore * TE_NULLABLE * TE_NONNULL semaphore,
+												uint64_t *waitValue);
 
 /*
  Initiates rendering of a frame. 
@@ -469,6 +722,12 @@ TE_EXPORT TEResult TEInstanceStartFrameAtTime(TEInstance *instance, int64_t time
  alternatively the frame may complete as usual before the cancellation request is delivered.
 */
 TE_EXPORT TEResult TEInstanceCancelFrame(TEInstance *instance);
+
+/*
+ On return 'errors' is a list of TEErrors for the currently loaded file at the current frame.
+ The caller is responsible for releasing the returned TEErrorArray using TERelease(). 
+ */
+TE_EXPORT TEResult TEInstanceGetErrors(TEInstance *instance, struct TEErrorArray * TE_NULLABLE * TE_NONNULL errors);
 
 /*
  Link Layout
@@ -512,6 +771,12 @@ TE_EXPORT TEResult TEInstanceLinkGetInfo(TEInstance *instance, const char *ident
 TE_EXPORT TEResult TEInstanceLinkGetState(TEInstance *instance, const char *identifier, struct TELinkState * TE_NULLABLE * TE_NONNULL state);
 
 /*
+ Returns true if the link has a list of choices associated with it, suitable for presentation to the user as a menu.
+ Only TELinkTypeInt and TELinkTypeString may have a list of choices.
+ */
+TE_EXPORT bool TEInstanceLinkHasChoices(TEInstance *instance, const char *identifier);
+
+/*
  On return 'labels' is a list of labels suitable for presentation to the user as options for choosing a value for the link denoted by 'identifier'.
  If 'identifier' does not offer a list of options then 'labels' will be set to NULL.
  Only TELinkTypeInt and TELinkTypeString may have a list of choices. For TELinkTypeInt, the corresponding value is the index of the label
@@ -529,6 +794,28 @@ TE_EXPORT TEResult TEInstanceLinkGetChoiceLabels(TEInstance *instance, const cha
  The caller is responsible for releasing the returned TEStringArray using TERelease().
 */
 TE_EXPORT TEResult TEInstanceLinkGetChoiceValues(TEInstance *instance, const char *identifier, struct TEStringArray * TE_NULLABLE * TE_NONNULL values);
+
+/*
+ Returns true if a user-selected color tint is associated with a link. If no tint has been set by the user, or if no matching link exists, returns false.
+*/
+TE_EXPORT bool TEInstanceLinkHasUserTint(TEInstance *instance, const char *identifier);
+
+/*
+ If a user-selected color tint is associated with the link 'tint' is set.
+ 'tint' is a pointer to a TEColor which will be set to the color tint on return
+ If no color tint is set, returns TEResultNoMatchingEntity
+*/
+TE_EXPORT TEResult TEInstanceLinkGetUserTint(TEInstance *instance, const char *identifier, struct TEColor * TE_NONNULL tint);
+
+/*
+ Notifies the instance of the caller's interest in a link
+ The default for all links is TELinkInterestAll
+ Setting TELinkInterestNone or TELinkInterestNoValues permits the instance to reduce the work done for those links
+ After getting a value, setting TELinkInterestSubsequentValues can allow the instance to release or re-use resources sooner
+ */
+TE_EXPORT TEResult TEInstanceLinkSetInterest(TEInstance *instance, const char *identifier, TELinkInterest interest);
+
+TE_EXPORT TELinkInterest TEInstanceLinkGetInterest(TEInstance *instance, const char *identifier);
 
 /*
  Getting Link Values
@@ -550,11 +837,8 @@ TE_EXPORT TEResult TEInstanceLinkGetStringValue(TEInstance *instance, const char
  A TEGraphicsContext can be used to convert the returned texture to any desired type.
  The caller is responsible for releasing the returned TETexture using TERelease()
  */
-#if defined(__APPLE__)
-TE_EXPORT TEResult TEInstanceLinkGetTextureValue(TEInstance *instance, const char *identifier, TELinkValue which, TEIOSurfaceTexture * TE_NULLABLE * TE_NONNULL value);
-#else
-TE_EXPORT TEResult TEInstanceLinkGetTextureValue(TEInstance *instance, const char *identifier, TELinkValue which, TEDXGITexture * TE_NULLABLE * TE_NONNULL value);
-#endif
+TE_EXPORT TEResult TEInstanceLinkGetTextureValue(TEInstance *instance, const char *identifier, TELinkValue which, TETexture * TE_NULLABLE * TE_NONNULL value);
+
 /*
  On successful completion 'value' is set to a TETable or NULL if no value is set.
  The caller is responsible for releasing the returned TETable using TERelease()
@@ -596,12 +880,12 @@ TE_EXPORT TEResult TEInstanceLinkSetStringValue(TEInstance *instance, const char
  Sets the value of a texture input link
  'texture' may be retained by the instance
  'context' is a valid TEGraphicsContext of a type suitable for working with the provided texture.
-	NULL may be passed ONLY if 'texture' is of type TETextureTypeDXGI or TETextureTypeIOSurface
+	NULL may be passed ONLY if 'texture' is of type TETextureTypeD3DShared or TETextureTypeIOSurface or TETextureTypeVulkan
 	Work may be done in the provided graphics context by this call.
  	An OpenGL context may change the current framebuffer and GL_TEXTURE_2D bindings during this call.
 	This may be a different context than any previously passed to TEInstanceAssociateGraphicsContext().
  */
-TE_EXPORT TEResult TEInstanceLinkSetTextureValue(TEInstance *instance, const char *identifier, const TETexture *TE_NULLABLE texture, TEGraphicsContext * TE_NULLABLE context);
+TE_EXPORT TEResult TEInstanceLinkSetTextureValue(TEInstance *instance, const char *identifier, TETexture *TE_NULLABLE texture, TEGraphicsContext * TE_NULLABLE context);
 
 /*
  Sets the value of a float buffer input link, replacing any previously set value.
@@ -633,7 +917,7 @@ TE_EXPORT TEResult TEInstanceLinkSetTableValue(TEInstance *instance, const char 
  An error will be returned if the link cannot be set using the provided TEObject.
  'value' may be retained by the instance
  */
-TE_EXPORT TEResult TEInstanceLinkSetObjectValue(TEInstance *instance, const char *identifier, const TEObject * TE_NULLABLE object);
+TE_EXPORT TEResult TEInstanceLinkSetObjectValue(TEInstance *instance, const char *identifier, TEObject * TE_NULLABLE object);
 
 #define kStructAlignmentError "struct misaligned for library"
 

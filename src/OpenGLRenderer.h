@@ -52,18 +52,20 @@ public:
 	virtual void	resize(int width, int height) override;
 	virtual void	stop();
 	virtual bool	render();
-	virtual size_t	getLeftSideImageCount() const;
-	virtual void	addLeftSideImage(const unsigned char *rgba, size_t bytesPerRow, int width, int height);
-	virtual void	clearLeftSideImages();
-	virtual void	addRightSideImage();
-	virtual void	setRightSideImage(size_t index, const TouchObject<TETexture> &texture) override;
-	virtual void	clearRightSideImages();
-	virtual TETexture*	createLeftSideImage(size_t index);
+	virtual size_t	getInputImageCount() const;
+	virtual void	addInputImage(const unsigned char *rgba, size_t bytesPerRow, int width, int height);
+	virtual void	clearInputImages();
+	virtual void	addOutputImage();
+	virtual bool	updateOutputImage(const TouchObject<TEInstance>& instance, size_t index, const std::string& identifier) override;
+	virtual void	clearOutputImages();
+	virtual bool	getInputImage(size_t index, TouchObject<TETexture>& texture, TouchObject<TESemaphore>& semaphore, uint64_t& waitValue) override;
+
+	virtual const std::wstring& getDeviceName() const override;
 private:
 	static const char* VertexShader;
 	static const char* FragmentShader;
 
-	static void		textureReleaseCallback(GLuint texture, void *info);
+	static void		textureReleaseCallback(GLuint texture, TEObjectEvent event, void *info);
 	void			drawImages(std::vector<OpenGLImage>& images, float scale, float xOffset);
 
 	OpenGLProgram	myProgram;
@@ -73,8 +75,9 @@ private:
 	GLint			myTAIndex = -1;
 	HGLRC			myRenderingContext = nullptr;
 	HDC				myDC = nullptr;
-	TEOpenGLContext* myContext = nullptr;
-	std::vector<OpenGLImage> myLeftSideImages;
-	std::vector<OpenGLImage> myRightSideImages;
+	TouchObject<TEOpenGLContext> myContext;
+	std::vector<OpenGLImage> myInputImages;
+	std::vector<OpenGLImage> myOutputImages;
+	std::wstring	myDeviceName;
 };
 

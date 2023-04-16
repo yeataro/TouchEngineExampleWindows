@@ -16,12 +16,14 @@
 #include <commdlg.h>
 #include "DocumentWindow.h"
 #include "Resource.h"
-#include "DirectXRenderer.h"
+#include "DX11Renderer.h"
+#include "DX12Renderer.h"
 #include "OpenGLRenderer.h"
+#include "Strings.h"
 #include <codecvt>
 #include <array>
 
-wchar_t *DocumentWindow::WindowClassName = L"DocumentWindow";
+const wchar_t *DocumentWindow::WindowClassName = L"DocumentWindow";
 const int32_t DocumentWindow::InputChannelCount = 2;
 const double DocumentWindow::InputSampleRate = 44100.0;
 const int64_t DocumentWindow::InputSampleLimit = 44100 / 2;
@@ -179,8 +181,11 @@ WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		case IDM_EXIT:
 			DestroyWindow(hWnd);
 			break;
-		case ID_FILE_OPEN:
-			theOpenDocument = Open(hWnd, DocumentWindow::Mode::DirectX);
+		case ID_FILE_OPEN_DX11:
+			theOpenDocument = Open(hWnd, DocumentWindow::Mode::DirectX11);
+			break;
+		case ID_FILE_OPEN_DX12:
+			theOpenDocument = Open(hWnd, DocumentWindow::Mode::DirectX12);
 			break;
 		case ID_FILE_OPENOPENGL:
 			theOpenDocument = Open(hWnd, DocumentWindow::Mode::OpenGL);
@@ -318,9 +323,7 @@ DocumentWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			UINT width = LOWORD(lParam);
 			UINT height = HIWORD(lParam);
 			theOpenDocument->myRenderer->resize(width, height);
-			bool loaded, changed, frame;
-			theOpenDocument->getState(loaded, changed, frame);
-			theOpenDocument->render(loaded);
+			theOpenDocument->update();
 		}
 		break;
 	}
@@ -342,6 +345,18 @@ DocumentWindow::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	return LRESULT();
 }
 
+void DocumentWindow::didConfigure(TEResult result)
+{
+	// Configuration can be cancelled by a subsequent configuration or other action
+	// - we can ignore the event in that case and await a following one
+	if (result != TEResultCancelled)
+	{
+		std::lock_guard<std::mutex> guard(myMutex);
+		myConfigureRenderer = true;
+		myConfigureResult = result;
+	}
+}
+
 void
 DocumentWindow::eventCallback(TEInstance * instance,
 									TEEvent event,
@@ -356,8 +371,13 @@ DocumentWindow::eventCallback(TEInstance * instance,
 
 	switch (event)
 	{
+	case TEEventInstanceReady:
+		window->didConfigure(result);
+		break;
 	case TEEventInstanceDidLoad:
 		window->didLoad();
+		break;
+	case TEEventInstanceDidUnload:
 		break;
 	case TEEventFrameDidFinish:
 		window->endFrame(start_time_value, start_time_scale, result);
@@ -390,8 +410,8 @@ DocumentWindow::linkEventCallback(TEInstance * instance, TELinkEvent event, cons
 void
 DocumentWindow::linkValueChange(const char* identifier)
 {
-	TELinkInfo* link = nullptr;
-	TEResult result = TEInstanceLinkGetInfo(myInstance, identifier, &link);
+	TouchObject<TELinkInfo> link;
+	TEResult result = TEInstanceLinkGetInfo(myInstance, identifier, link.take());
 	if (result == TEResultSuccess && link->scope == TEScopeOutput)
 	{
 		switch (link->type)
@@ -410,12 +430,11 @@ DocumentWindow::linkValueChange(const char* identifier)
 		}
 		case TELinkTypeString:
 		{
-			TEString* value;
-			result = TEInstanceLinkGetStringValue(myInstance, identifier, TELinkValueCurrent, &value);
+			TouchObject<TEString> value;
+			result = TEInstanceLinkGetStringValue(myInstance, identifier, TELinkValueCurrent, value.take());
 			if (result == TEResultSuccess)
 			{
 				// Use value->string here
-				TERelease(value);
 			}
 			break;
 		}
@@ -428,8 +447,8 @@ DocumentWindow::linkValueChange(const char* identifier)
 		}
 		case TELinkTypeFloatBuffer:
 		{
-			TEFloatBuffer* buffer = nullptr;
-			result = TEInstanceLinkGetFloatBufferValue(myInstance, identifier, TELinkValueCurrent, &buffer);
+			TouchObject<TEFloatBuffer> buffer;
+			result = TEInstanceLinkGetFloatBufferValue(myInstance, identifier, TELinkValueCurrent, buffer.take());
 
 			if (result == TEResultSuccess)
 			{
@@ -445,33 +464,32 @@ DocumentWindow::linkValueChange(const char* identifier)
 						float value = data[channel][0];
 					}
 				}
-				TERelease(&buffer);
 			}
 			break;
 		}
 		case TELinkTypeStringData:
 		{
-			TEObject* value = nullptr;
-			result = TEInstanceLinkGetObjectValue(myInstance, identifier, TELinkValueCurrent, &value);
+			TouchObject<TEObject> value;
+			result = TEInstanceLinkGetObjectValue(myInstance, identifier, TELinkValueCurrent, value.take());
 			// String data can be a TETable or TEString, so check the type
 			if (value && TEGetType(value) == TEObjectTypeTable)
 			{
-				TETable* table = static_cast<TETable*>(value);
+				TouchObject<TETable> table;
+				table.set(static_cast<TETable*>(value.get()));
 				// do something with the table
 			}
 			else if (value && TEGetType(value) == TEObjectTypeString)
 			{
-				TEString* string = reinterpret_cast<TEString*>(value);
+				TouchObject<TEString> string;
+				string.set(static_cast<TEString*>(value.get()));
 				// do something with the string
 			}
-			TERelease(&value);
 			break;
 		}
 		default:
 			break;
 		}
 	}
-	TERelease(&link);
 }
 
 void
@@ -481,9 +499,11 @@ DocumentWindow::endFrame(int64_t time_value, int32_t time_scale, TEResult result
 }
 
 void
-DocumentWindow::getState(bool& loaded, bool& linksChanged, bool& inFrame)
+DocumentWindow::getState(bool& configured, bool& loaded, bool& linksChanged, bool& inFrame)
 {
 	std::lock_guard<std::mutex> guard(myMutex);
+	configured = myConfigureRenderer;
+	myConfigureRenderer = false;
 	loaded = myDidLoad;
 	if (myDidLoad)
 	{
@@ -507,19 +527,27 @@ DocumentWindow::setInFrame(bool inFrame)
 }
 
 DocumentWindow::DocumentWindow(std::wstring path, Mode mode)
-	: myPath(path), myMode(mode), myInstance(nullptr), myWindow(nullptr),
-	myRenderer(mode == Mode::DirectX ? static_cast<std::unique_ptr<Renderer>>(std::make_unique<DirectXRenderer>()) : static_cast<std::unique_ptr<Renderer>>(std::make_unique<OpenGLRenderer>())),
-	myDidLoad(false), myInFrame(false), myLastFloatValue(0.0), myPendingLayoutChange(false)
+	: myPath(path), myMode(mode)
 {
+	switch (mode)
+	{
+	case Mode::DirectX11:
+		myRenderer = static_cast<std::unique_ptr<Renderer>>(std::make_unique<DX11Renderer>());
+		break;
+	case Mode::DirectX12:
+		myRenderer = static_cast<std::unique_ptr<Renderer>>(std::make_unique<DX12Renderer>());
+		break;
+	default:
+		myRenderer = static_cast<std::unique_ptr<Renderer>>(std::make_unique<OpenGLRenderer>());
+		break;
+	}
 }
 
 
 DocumentWindow::~DocumentWindow()
 {
-	if (myInstance)
-	{
-		TERelease(&myInstance);
-	}
+	// Do this first so releated resources our Renderer may be interested in are released
+	myInstance.reset();
 
 	myRenderer->stop();
 
@@ -543,14 +571,19 @@ DocumentWindow::openWindow(HWND parent)
 	AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, false);
 
 	std::wstring title = getPath();
-	if (getMode() == Mode::DirectX)
+	switch (getMode())
 	{
-		title += L" (DirectX)";
+	case Mode::DirectX11:
+		title += L" (DirectX 11 - ";
+		break;
+	case Mode::DirectX12:
+		title += L" (DirectX 12 - ";
+		break;
+	default:
+		title += L" (OpenGL - ";
+		break;
 	}
-	else
-	{
-		title += L" (OpenGL)";
-	}
+	
 	myWindow = CreateWindowW(WindowClassName,
 		title.data(),
 		WS_OVERLAPPEDWINDOW | myRenderer->getWindowStyleFlags(),
@@ -579,29 +612,43 @@ DocumentWindow::openWindow(HWND parent)
 	}
 	if (SUCCEEDED(result))
 	{
+		title += myRenderer->getDeviceName();
+		title += L")";
+		SetWindowText(myWindow, title.c_str());
 		myRenderer->resize(InitialWindowWidth, InitialWindowHeight);
 	}
 	if (SUCCEEDED(result))
 	{
-		std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
-		std::string utf8 = converter.to_bytes(getPath());
+		std::string utf8 = ConvertToMultiByte(getPath());
+		
+		if (utf8.empty())
+		{
+			result = HRESULT_FROM_WIN32(GetLastError());
+		}
 
-		TEResult teresult = TEInstanceCreate(eventCallback, linkEventCallback, this, &myInstance);
-		if (teresult == TEResultSuccess)
+		if (SUCCEEDED(result))
 		{
-			teresult = TEInstanceAssociateGraphicsContext(myInstance, myRenderer->getTEContext());
-		}
-		if (teresult == TEResultSuccess)
-		{
-			teresult = TEInstanceLoad(myInstance, utf8.c_str(), TETimeExternal);
-		}
-		if (teresult == TEResultSuccess)
-		{
-			teresult = TEInstanceResume(myInstance);
-		}
-		assert(teresult == TEResultSuccess);
+			TEResult teresult = TEInstanceCreate(eventCallback, linkEventCallback, this, myInstance.take());
+			if (teresult == TEResultSuccess)
+			{
+				teresult = TEInstanceAssociateGraphicsContext(myInstance, myRenderer->getTEContext());
+			}
+			if (teresult == TEResultSuccess)
+			{
+				teresult = TEInstanceConfigure(myInstance, utf8.c_str(), TETimeExternal);
+			}
+			if (teresult == TEResultSuccess)
+			{
+				teresult = TEInstanceLoad(myInstance);
+			}
+			if (teresult == TEResultSuccess)
+			{
+				teresult = TEInstanceResume(myInstance);
+			}
+			assert(teresult == TEResultSuccess);
 
-		SetTimer(myWindow, UpdateTimerID, static_cast<UINT>(std::ceil(1000. / FramesPerSecond)), nullptr);
+			SetTimer(myWindow, UpdateTimerID, static_cast<UINT>(std::ceil(1000. / FramesPerSecond)), nullptr);
+		}
 
 		// Draw once
 		render(false);
@@ -618,8 +665,43 @@ DocumentWindow::linkLayoutDidChange()
 void
 DocumentWindow::update()
 {
-	bool loaded, linksChanged, inFrame;
-	getState(loaded, linksChanged, inFrame);
+	bool configured, loaded, linksChanged, inFrame;
+	getState(configured, loaded, linksChanged, inFrame);
+
+	if (configured)
+	{
+		std::wstring message;
+		if (TEResultGetSeverity(myConfigureResult) == TESeverityError)
+		{			
+			const char *description = TEResultGetDescription(myConfigureResult);
+			
+			message = L"There was an error configuring TouchEngine: ";
+			if (description)
+			{
+				message += ConvertToWide(description);
+			}
+			else
+			{
+				message += std::to_wstring(myConfigureResult);
+			}
+			
+			myConfigureError = true;
+		}
+		else
+		{
+			myConfigureError = !myRenderer->configure(myInstance, message);
+		}
+		if (myConfigureError)
+		{
+			MessageBox(myWindow, message.c_str(), L"Error", MB_OK | MB_ICONERROR);
+			SendMessage(myWindow, WM_CLOSE, 0, 0);
+		}
+	}
+
+	if (myConfigureError)
+	{
+		return;
+	}
 
 	bool changed = linksChanged;
 
@@ -634,21 +716,21 @@ DocumentWindow::update()
 		changed = changed || applyOutputTextureChange();
 
 		// Examples of setting input links
-		TEStringArray* groups;
-		TEResult result = TEInstanceGetLinkGroups(myInstance, TEScopeInput, &groups);
+		TouchObject<TEStringArray> groups;
+		TEResult result = TEInstanceGetLinkGroups(myInstance, TEScopeInput, groups.take());
 		if (result == TEResultSuccess)
 		{
 			int textureCount = 0;
 			for (int32_t i = 0; i < groups->count; i++)
 			{
-				TEStringArray* children;
-				result = TEInstanceLinkGetChildren(myInstance, groups->strings[i], &children);
+				TouchObject<TEStringArray> children;
+				result = TEInstanceLinkGetChildren(myInstance, groups->strings[i], children.take());
 				if (result == TEResultSuccess)
 				{
 					for (int32_t j = 0; j < children->count; j++)
 					{
-						TELinkInfo* info;
-						result = TEInstanceLinkGetInfo(myInstance, children->strings[j], &info);
+						TouchObject<TELinkInfo> info;
+						result = TEInstanceLinkGetInfo(myInstance, children->strings[j], info.take());
 						if (result == TEResultSuccess)
 						{
 							switch (info->type)
@@ -670,31 +752,40 @@ DocumentWindow::update()
 								break;
 							case TELinkTypeTexture:
 							{
-								TETexture* texture = myRenderer->createLeftSideImage(textureCount);
-								if (texture)
+								TouchObject<TETexture> texture;
+								TouchObject<TESemaphore> semaphore;
+								uint64_t waitValue = 0;
+								// Our OpenGL and D3D11 renderers use their TEGraphicsContexts to handle setting inputs, meaning they needn't do any sync themselves
+								// - but at the cost of a texture copy by the TEGraphicsContext
+								// Our D3D12 renderer creates shareable textures, so it must handle sync itself - when setting a texture we uses a texture transfer
+								// to supply a fence and wait-value to the instance - the instance will insert a wait for the fence prior to consuming the input texture
+								if (myRenderer->getInputImage(textureCount, texture, semaphore, waitValue))
 								{
 									result = TEInstanceLinkSetTextureValue(myInstance, info->identifier, texture, myRenderer->getTEContext());
-									TERelease(&texture);
+									if (result == TEResultSuccess && myRenderer->doesInputTextureTransfer())
+									{
+										result = TEInstanceAddTextureTransfer(myInstance, texture, semaphore, waitValue);
+									}
 								}
 								textureCount++;
 								break;
 							}
 							case TELinkTypeFloatBuffer:
 							{
-								TEFloatBuffer* buffer = nullptr;
+								TouchObject<TEFloatBuffer> buffer;
 								// Creating a copy of an existing buffer is more efficient than creating a new one every time
-								result = TEInstanceLinkGetFloatBufferValue(myInstance, info->identifier, TELinkValueCurrent, &buffer);
+								result = TEInstanceLinkGetFloatBufferValue(myInstance, info->identifier, TELinkValueCurrent, buffer.take());
 								if (result == TEResultSuccess)
 								{
 									// You might want to check more properties of the buffer than this
 									if (buffer && TEFloatBufferGetCapacity(buffer) < 1 || TEFloatBufferGetChannelCount(buffer) != 2)
 									{
-										TERelease(&buffer);
+										buffer.reset();
 									}
 									if (buffer)
 									{
-										auto copied = TEFloatBufferCreateCopy(buffer);
-										TERelease(&buffer);
+										TouchObject<TEFloatBuffer> copied;
+										copied.take(TEFloatBufferCreateCopy(buffer));
 										buffer = copied;
 									}
 									else
@@ -702,15 +793,13 @@ DocumentWindow::update()
 										// Two channels, capacity of one sample per channel, no channel names
 										// This buffer is not time-dependent, see TEFloatBuffer.h for handling time-dependent samples such
 										// as audio.
-										buffer = TEFloatBufferCreate(-1, 2, 1, nullptr);
+										buffer.take(TEFloatBufferCreate(-1, 2, 1, nullptr));
 									}
 									float value = static_cast<float>(fmod(myLastFloatValue, 1.0));
 									std::array<const float*, 2> channels{ &value, &value };
 									TEFloatBufferSetValues(buffer, channels.data(), 1);
 
 									result = TEInstanceLinkSetFloatBufferValue(myInstance, info->identifier, buffer);
-
-									TERelease(&buffer);
 								}
 								break;
 							}
@@ -721,19 +810,19 @@ DocumentWindow::update()
 
 								// It is more efficient to create a copy of an existing table than to create a new one, so check
 								// for an existing table to re-use first.
-								TEObject* value = nullptr;
-								result = TEInstanceLinkGetObjectValue(myInstance, info->identifier, TELinkValueCurrent, &value);
+								TouchObject<TEObject> value;
+								result = TEInstanceLinkGetObjectValue(myInstance, info->identifier, TELinkValueCurrent, value.take());
 
 								if (result == TEResultSuccess)
 								{
-									TETable* table = nullptr;
+									TouchObject<TETable> table ;
 									if (value && TEGetType(value) == TEObjectTypeTable)
 									{
-										table = TETableCreateCopy(static_cast<TETable*>(value));
+										table.take(TETableCreateCopy(static_cast<TETable*>(value.get())));
 									}
 									else
 									{
-										table = TETableCreate();
+										table.take(TETableCreate());
 									}
 									TETableResize(table, 3, 2);
 									for (int column = 0; column < 2; column++)
@@ -744,19 +833,14 @@ DocumentWindow::update()
 										}
 									}
 									result = TEInstanceLinkSetTableValue(myInstance, info->identifier, table);
-
-									TERelease(&table);
 								}
-								TERelease(&value);
 								break;
 							}
 							default:
 								break;
 							}
-							TERelease(&info);
 						}
 					}
-					TERelease(&children);
 				}
 			}
 		}
@@ -798,36 +882,37 @@ DocumentWindow::render(bool loaded)
 void
 DocumentWindow::applyLayoutChange()
 {
-	myRenderer->clearLeftSideImages();
-	myRenderer->clearRightSideImages();
+	myRenderer->beginImageLayout();
+
+	myRenderer->clearInputImages();
+	myRenderer->clearOutputImages();
 	myOutputLinkTextureMap.clear();
 
 	for (auto scope : { TEScopeInput, TEScopeOutput })
 	{
-		TEStringArray *groups;
-		TEResult result = TEInstanceGetLinkGroups(myInstance, scope, &groups);
+		TouchObject<TEStringArray> groups;
+		TEResult result = TEInstanceGetLinkGroups(myInstance, scope, groups.take());
 		if (result == TEResultSuccess)
 		{
 			for (int32_t i = 0; i < groups->count; i++)
 			{
-				TELinkInfo *group;
-				result = TEInstanceLinkGetInfo(myInstance, groups->strings[i], &group);
+				TouchObject<TELinkInfo> group;
+				result = TEInstanceLinkGetInfo(myInstance, groups->strings[i], group.take());
 				if (result == TEResultSuccess)
 				{
 					// Use group info here
-					TERelease(&group);
 				}
-				TEStringArray *children = nullptr;
+				TouchObject<TEStringArray> children;
 				if (result == TEResultSuccess)
 				{
-					result = TEInstanceLinkGetChildren(myInstance, groups->strings[i], &children);
+					result = TEInstanceLinkGetChildren(myInstance, groups->strings[i], children.take());
 				}
 				if (result == TEResultSuccess)
 				{
 					for (int32_t j = 0; j < children->count; j++)
 					{
-						TELinkInfo *info;
-						result = TEInstanceLinkGetInfo(myInstance, children->strings[j], &info);
+						TouchObject<TELinkInfo> info;
+						result = TEInstanceLinkGetInfo(myInstance, children->strings[j], info.take());
 						if (result == TEResultSuccess)
 						{
 							if (result == TEResultSuccess && info->type == TELinkTypeTexture)
@@ -836,34 +921,51 @@ DocumentWindow::applyLayoutChange()
 								{
 									std::vector<unsigned char> tex( ImageWidth * ImageHeight * 4 );
 
-									for (int y = 0; y < ImageHeight; y++)
+									std::array<Gradient, 4> gradients{
+										Gradient{{0, 0, 0}, {255,0,255}},
+										Gradient{{100, 100, 100}, {255, 255, 0}},
+										Gradient{{40, 40, 40}, {255, 255, 255}},
+										Gradient{{255, 0, 0}, {255, 0, 255}}
+									};
+
+									const auto &gradient = gradients[myRenderer->getInputImageCount() % gradients.size()];
+									auto& start = gradient.start;
+									auto& end = gradient.end;
+									for (size_t y = 0; y < ImageHeight; y++)
 									{
-										for (int x = 0; x < ImageWidth; x++)
+										for (size_t x = 0; x < ImageWidth; x++)
 										{
-											unsigned char xColor = static_cast<unsigned char>(static_cast<double>(x) / (ImageWidth-1) * 255.0);
-											unsigned char yColor = static_cast<unsigned char>(static_cast<double>(y) / (ImageHeight-1) * 255.0);
-											tex[(y * ImageWidth * 4) + (x * 4) + 0] = xColor;
-											tex[(y * ImageWidth * 4) + (x * 4) + 1] = 0;
-											tex[(y * ImageWidth * 4) + (x * 4) + 2] = getMode() == Mode::OpenGL ? 255 - yColor : yColor;
+											double xColor = static_cast<double>(x) / (ImageWidth-1);
+											double yColor = static_cast<double>(y) / (ImageHeight-1);
+											if (getMode() == Mode::OpenGL)
+												yColor = 1.0 - yColor;
+											Color xColor1 = {
+												start.red + static_cast<int>(yColor * (static_cast<double>(end.red) - start.red)),
+												start.green + static_cast<int>(xColor * (static_cast<double>(end.green) - start.green)),
+												start.blue + static_cast<int>(xColor * (static_cast<double>(end.blue) - start.blue))
+											};
+											tex[(y * ImageWidth * 4) + (x * 4) + 0] = xColor1.blue;
+											tex[(y * ImageWidth * 4) + (x * 4) + 1] = xColor1.green;
+											tex[(y * ImageWidth * 4) + (x * 4) + 2] = xColor1.red;
 											tex[(y * ImageWidth * 4) + (x * 4) + 3] = 255;
 										}
 									}
-									myRenderer->addLeftSideImage(tex.data(), ImageWidth * 4, ImageWidth, ImageHeight);
+									myRenderer->addInputImage(tex.data(), ImageWidth * 4, ImageWidth, ImageHeight);
 								}
 								else
 								{
-									myRenderer->addRightSideImage();
+									myRenderer->addOutputImage();
 									myOutputLinkTextureMap[info->identifier] = myRenderer->getRightSideImageCount() - 1;
 								}
 							}
-							TERelease(&info);
 						}
 					}
-					TERelease(&children);
 				}
 			}
 		}
 	}
+
+	myRenderer->endImageLayout();
 }
 
 bool
@@ -878,14 +980,9 @@ DocumentWindow::applyOutputTextureChange()
 
 	for (const auto & identifier : changes)
 	{
-		TouchObject<TEDXGITexture> texture;
-		TEResult result = TEInstanceLinkGetTextureValue(myInstance, identifier.c_str(), TELinkValueCurrent, texture.take());
-		if (result == TEResultSuccess)
-		{
-			size_t imageIndex = myOutputLinkTextureMap[identifier];
+		size_t imageIndex = myOutputLinkTextureMap[identifier];
 
-			myRenderer->setRightSideImage(imageIndex, texture);
-		}
+		myRenderer->updateOutputImage(myInstance, imageIndex, identifier);
 	}
 
 	return !changes.empty();
